@@ -1,0 +1,45 @@
+<ion-header>
+  <ion-navbar>
+    <ion-title>
+      Stock Trader
+    </ion-title>
+  </ion-navbar>
+</ion-header>
+
+<ion-content>
+
+  <ion-card>
+      <ion-card-header>
+       Wallet Status
+      </ion-card-header>
+      <ion-card-content>
+          <ion-badge item-right>Bal: ${{this.balance.balance.toFixed(2)}}</ion-badge> <ion-badge item-right>Exp: ${{this.balance.exposure.toFixed(2)}}</ion-badge> <ion-badge item-right>Tot: ${{(this.balance.balance + this.balance.exposure).toFixed(2)}}</ion-badge>
+          <!--Enable for graph <canvas #lineCanvas ng-show="this.showGraph"></canvas>-->
+      </ion-card-content>
+  </ion-card>
+
+  <ion-list inset no-padding>
+    <ion-item *ngFor="let s of this.stocks">
+      <ion-grid no-padding>
+        <ion-row align-items-center justify-content-start>
+          <ion-col>
+            <h3>{{s.code}}</h3>
+          </ion-col>
+          <ion-col>
+            <h4>${{s.price.toFixed(1)}}</h4>
+          </ion-col>
+          <ion-col>
+            <h4><ion-icon [name]="(s.change > 0)?'trending-up':'trending-down'"></ion-icon>  {{(s.change * 100).toFixed(1)}}%</h4>
+          </ion-col>
+          <ion-col>
+            <ion-badge item-right>{{s.holding}}</ion-badge>
+          </ion-col>
+          <ion-col>
+            <button ion-button small (click)="this.buy(s.code)">Buy</button> <button ion-button color="danger" small [disabled]="s.holding <= 0" (click)="this.sell(s.code)">Sell</button>
+          </ion-col>
+        </ion-row>
+      </ion-grid>
+    </ion-item>
+  </ion-list>
+
+</ion-content>
