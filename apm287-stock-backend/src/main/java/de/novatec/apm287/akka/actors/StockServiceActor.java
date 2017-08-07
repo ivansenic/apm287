@@ -8,10 +8,15 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import akka.actor.AbstractActor;
 import akka.actor.ActorRef;
+import akka.actor.ActorSystem;
 import akka.actor.Props;
 import akka.pattern.CircuitBreaker;
+import akka.persistence.AbstractPersistentActor;
+import akka.persistence.RecoveryCompleted;
+import akka.persistence.SnapshotOffer;
+import de.novatec.apm287.akka.actors.state.BalanceState;
+import de.novatec.apm287.akka.actors.state.BalanceUpdateEvent;
 import de.novatec.apm287.akka.messages.Message.BalanceReply;
 import de.novatec.apm287.akka.messages.Message.BalanceRequest;
 import de.novatec.apm287.akka.messages.Message.BuyRequest;
@@ -26,7 +31,7 @@ import de.novatec.apm287.common.Util;
 import de.novatec.apm287.common.service.ApprovalService;
 import scala.concurrent.duration.Duration;
 
-public class StockServiceActor extends AbstractActor {
+public class StockServiceActor extends AbstractPersistentActor {
 
 	/**
 	 * @return props for creating this actor.
@@ -36,9 +41,9 @@ public class StockServiceActor extends AbstractActor {
 	}
 
 	/**
-	 * Default balance to start with is 10.000.
+	 * Current balance state.
 	 */
-	private double balance = 10_000;
+	private BalanceState balanceState;
 
 	/**
 	 * When buy/sell comes with more than this stock size we must approve this.
@@ -66,11 +71,32 @@ public class StockServiceActor extends AbstractActor {
 	 */
 	public StockServiceActor(Optional<Double> balance, ApprovalService approvalService) {
 		if (balance.isPresent()) {
-			this.balance = balance.get().doubleValue();
+			this.balanceState = new BalanceState(balance.get().doubleValue());
+		} else {
+			this.balanceState = new BalanceState(10_000);
 		}
 		this.approvalService = approvalService;
 		this.circuitBreaker = new CircuitBreaker(getContext().dispatcher(), getContext().system().scheduler(), 5,
 				Duration.create(50, TimeUnit.MILLISECONDS), Duration.create(1, TimeUnit.MINUTES));
+		
+		if (10_000 == balanceState.getTotal()) {
+			ActorSystem system = getContext().getSystem();
+			system.scheduler().scheduleOnce(Duration.create(1, "minute"), getSelf(), "restart", system.dispatcher(), null);
+		}
+	}
+
+	@Override
+	public String persistenceId() {
+		return "balance-update-events";
+	}
+
+	@Override
+	public Receive createReceiveRecover() {
+		return receiveBuilder()
+				.match(BalanceUpdateEvent.class, balanceState::update)
+				.match(SnapshotOffer.class, ss -> balanceState = (BalanceState) ss.snapshot())
+				.match(RecoveryCompleted.class, r -> System.out.println("Balance after recovery " + balanceState.getTotal()))
+				.build();
 	}
 
 	/**
@@ -79,16 +105,20 @@ public class StockServiceActor extends AbstractActor {
 	@Override
 	public Receive createReceive() {
 		return receiveBuilder()
-			.match(PriceUpdate.class, this::priceUpdate)
-			.match(OverviewRequest.class, r -> {
-				getSender().tell(new OverviewReply(Collections.unmodifiableCollection(codeToStock.values())), getSelf());
-			})
-			.match(BalanceRequest.class, r -> {
-				BalanceInfo balanceInfo = new BalanceInfo(balance, getExposure());
-				getSender().tell(new BalanceReply(balanceInfo), getSelf());
-			})
-			.match(BuyRequest.class, this::buyRequest).match(SellRequest.class, this::sellRequest)
-			.build();
+				.match(PriceUpdate.class, this::priceUpdate).match(OverviewRequest.class, r -> {
+					getSender().tell(new OverviewReply(Collections.unmodifiableCollection(codeToStock.values())), getSelf());
+				})
+				.match(BalanceRequest.class, r -> {
+					BalanceInfo balanceInfo = new BalanceInfo(balanceState.getTotal(), getExposure());
+					getSender().tell(new BalanceReply(balanceInfo), getSelf());
+				})
+				.match(BuyRequest.class, this::buyRequest)
+				.match(SellRequest.class, this::sellRequest)
+				.matchEquals("restart", m -> {
+					System.out.println("Balance before failing " + balanceState.getTotal());
+					throw new Exception("I had to dieeee");
+				})
+				.build();
 	}
 
 	/**
@@ -113,20 +143,20 @@ public class StockServiceActor extends AbstractActor {
 		}
 
 		if (request.size > approveThreshold) {
-			// first call service with circuit breaker then handle result in async mode
+			// first call service with circuit breaker then handle result in
+			// async mode
 			// note here we are on 50 ms timeout
 			final ActorRef sender = getSender();
-			
-			circuitBreaker.callWithCircuitBreakerCS(() -> 
-				CompletableFuture.supplyAsync(() -> {
-					return approvalService.approve(request.code, request.size);
-				}, getContext().dispatcher())
-			).whenCompleteAsync((b, t) -> {
+
+			circuitBreaker.callWithCircuitBreakerCS(() -> CompletableFuture.supplyAsync(() -> {
+				return approvalService.approve(request.code, request.size);
+			}, getContext().dispatcher())).whenCompleteAsync((b, t) -> {
 				if (null != t) {
 					if (t instanceof TimeoutException) {
 						sender.tell(new BuySellResponse(false, null, "Approval resulted in timeout."), getSelf());
 					} else {
-						sender.tell(new BuySellResponse(false, null, "Error during approval. " + t.getMessage()), getSelf());
+						sender.tell(new BuySellResponse(false, null, "Error during approval. " + t.getMessage()),
+								getSelf());
 					}
 				} else {
 					if (b) {
@@ -147,15 +177,17 @@ public class StockServiceActor extends AbstractActor {
 	private void executeBuy(BuyRequest request, ActorRef sender) {
 		StockInfo stockInfo = codeToStock.get(request.code);
 		double cost = stockInfo.price * request.size;
-		if (cost > balance) {
+		if (cost > balanceState.getTotal()) {
 			getSender().tell(new BuySellResponse(false, null, "Insufficient balance."), getSelf());
 			return;
 		}
 
-		balance -= cost;
-		stockInfo.holding += request.size;
-
-		sender.tell(new BuySellResponse(true, stockInfo), getSelf());
+		BalanceUpdateEvent balanceUpdateEvent = new BalanceUpdateEvent(-cost);
+		persist(balanceUpdateEvent, e -> {
+			balanceState.update(e);
+			stockInfo.holding += request.size;
+			sender.tell(new BuySellResponse(true, stockInfo), getSelf());
+		});
 	}
 
 	/**
@@ -178,12 +210,17 @@ public class StockServiceActor extends AbstractActor {
 		}
 
 		double cost = stockInfo.price * request.size;
-		balance += cost;
-		stockInfo.holding -= request.size;
-
-		getSender().tell(new BuySellResponse(true, stockInfo), getSelf());
+		BalanceUpdateEvent balanceUpdateEvent = new BalanceUpdateEvent(cost);
+		persist(balanceUpdateEvent, (BalanceUpdateEvent e) -> {
+			balanceState.update(balanceUpdateEvent);
+			stockInfo.holding -= request.size;
+			getSender().tell(new BuySellResponse(true, stockInfo), getSelf());
+			
+			// optionally save snapshot
+			// saveSnapshot(balanceState);
+		});
 	}
-
+	
 	/**
 	 * Updates price of a single stock.
 	 */

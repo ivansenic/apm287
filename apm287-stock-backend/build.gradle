@@ -30,6 +30,9 @@ repositories {
 dependencies {
 	compile('com.typesafe.akka:akka-actor_2.11:2.+')
 	compile('com.typesafe.akka:akka-stream_2.11:2.+')
+	compile('com.typesafe.akka:akka-persistence_2.11:2.+')
+	compile('org.iq80.leveldb:leveldb:0.7')
+	compile('org.fusesource.leveldbjni:leveldbjni-all:1.8')
 	compile('org.apache.commons:commons-lang3:3.+')
 	compile('com.google.guava:guava:22.0')
 	compile('org.springframework.boot:spring-boot-starter-web')
